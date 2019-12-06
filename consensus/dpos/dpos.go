@@ -242,18 +242,7 @@ func (d *Dpos) verifySeal(chain consensus.ChainReader, header *types.Header, par
 	} else {
 		parent = chain.GetHeader(header.ParentHash, number-1)
 	}
-	dposContext, err := types.NewDposContextFromProto(d.db, parent.DposContext)
-	if err != nil {
-		return err
-	}
-	epochContext := &EpochContext{DposContext: dposContext}
-	validator, err := epochContext.lookupValidator(header.Time.Int64())
-	if err != nil {
-		return err
-	}
-	if err := d.verifyBlockSigner(validator, header); err != nil {
-		return err
-	}
+	
 	return d.updateConfirmedBlockHeader(chain)
 }
 
@@ -272,178 +261,13 @@ func (d *Dpos) verifyBlockSigner(validator common.Address, header *types.Header)
 }
 
 func (d *Dpos) updateConfirmedBlockHeader(chain consensus.ChainReader) error {
-	if d.confirmedBlockHeader == nil {
-		header, err := d.loadConfirmedBlockHeader(chain)
-		if err != nil {
-			header = chain.GetHeaderByNumber(0)
-			if header == nil {
-				return err
-			}
-		}
-		d.confirmedBlockHeader = header
-	}
-
-	curHeader := chain.CurrentHeader()
-	epoch := int64(-1)
-	validatorMap := make(map[common.Address]bool)
-	for d.confirmedBlockHeader.Hash() != curHeader.Hash() &&
-		d.confirmedBlockHeader.Number.Uint64() < curHeader.Number.Uint64() {
-		curEpoch := curHeader.Time.Int64() / epochInterval
-		if curEpoch != epoch {
-			epoch = curEpoch
-			validatorMap = make(map[common.Address]bool)
-		}
-		// fast return
-		// if block number difference less consensusSize-witnessNum
-		// there is no need to check block is confirmed
-		if curHeader.Number.Int64()-d.confirmedBlockHeader.Number.Int64() < int64(consensusSize-len(validatorMap)) {
-			log.Debug("Dpos fast return", "current", curHeader.Number.String(), "confirmed", d.confirmedBlockHeader.Number.String(), "witnessCount", len(validatorMap))
-			return nil
-		}
-		validatorMap[curHeader.Validator] = true
-		if len(validatorMap) >= consensusSize {
-			d.confirmedBlockHeader = curHeader
-			if err := d.storeConfirmedBlockHeader(d.db); err != nil {
-				return err
-			}
-			log.Debug("dpos set confirmed block header success", "currentHeader", curHeader.Number.String())
-			return nil
-		}
-		curHeader = chain.GetHeaderByHash(curHeader.ParentHash)
-		if curHeader == nil {
-			return ErrNilBlockHeader
-		}
-	}
-	return nil
+	
 }
 
-func (s *Dpos) loadConfirmedBlockHeader(chain consensus.ChainReader) (*types.Header, error) {
-	key, err := s.db.Get(confirmedBlockHead)
-	if err != nil {
-		return nil, err
-	}
-	header := chain.GetHeaderByHash(common.BytesToHash(key))
-	if header == nil {
-		return nil, ErrNilBlockHeader
-	}
-	return header, nil
-}
-
-// store inserts the snapshot into the database.
-func (s *Dpos) storeConfirmedBlockHeader(db ethdb.Database) error {
-	return db.Put(confirmedBlockHead, s.confirmedBlockHeader.Hash().Bytes())
-}
-
-func (d *Dpos) Prepare(chain consensus.ChainReader, header *types.Header) error {
-	header.Nonce = types.BlockNonce{}
-	number := header.Number.Uint64()
-	if len(header.Extra) < extraVanity {
-		header.Extra = append(header.Extra, bytes.Repeat([]byte{0x00}, extraVanity-len(header.Extra))...)
-	}
-	header.Extra = header.Extra[:extraVanity]
-	header.Extra = append(header.Extra, make([]byte, extraSeal)...)
-	parent := chain.GetHeader(header.ParentHash, number-1)
-	if parent == nil {
-		return consensus.ErrUnknownAncestor
-	}
-	header.Difficulty = d.CalcDifficulty(chain, header.Time.Uint64(), parent)
-	header.Validator = d.signer
-	return nil
-}
-
-func AccumulateRewards(config *params.ChainConfig, state *state.StateDB, header *types.Header, uncles []*types.Header) {
-	// Select the correct block reward based on chain progression
-	blockReward := frontierBlockReward
-	if config.IsByzantium(header.Number) {
-		blockReward = byzantiumBlockReward
-	}
-	// Accumulate the rewards for the miner and any included uncles
-	reward := new(big.Int).Set(blockReward)
-	state.AddBalance(header.Coinbase, reward)
-}
-
-func AccumulatePosRewards( state *state.StateDB, header *types.Header, dposContext *types.DposContext) {
-	if header.Number.Uint64() == 1{
-		return
-	}
-
-	log.Info("*************** header.Coinbase :"+ header.Coinbase.String())
-	vote := dposContext.VoteTrie().Get(header.Coinbase.Bytes())
-	balance := state.GetBalance(header.Coinbase)
-	a := new(big.Int).Mul(new(big.Int).SetBytes(vote),balance)
-	log.Info("*************** age * balance :"+ a.String())
-	b := new(big.Int).SetInt64(100)
-	c := new(big.Int).Mul(a,b)
-	d := new(big.Int).SetInt64(30)
-	e := new(big.Int).Mul(c,d)
-	f := new(big.Int).Div(e,new(big.Int).SetInt64(10000))
-	g := new(big.Int).Div(f,new(big.Int).SetInt64(365))
-	q := new(big.Int).Div(g,new(big.Int).SetInt64(86400))
-	t := new(big.Int).Mul(q,new(big.Int).SetInt64(5))
-	log.Info("*************** reward :"+ t.String())
-	// Accumulate the rewards for the miner and any included uncles
-	reward := new(big.Int).Set(t)
-	state.AddBalance(header.Coinbase, reward)
-}
-func AddAge(header *types.Header, dposContext *types.DposContext) error {
-	candidateTrie := dposContext.CandidateTrie()
-	iterCandidate := trie.NewIterator(candidateTrie.NodeIterator(nil))
-	existCandidate := iterCandidate.Next()
-	if !existCandidate {
-		return errors.New("no candidates")
-	}
-	for existCandidate {
-		candidate := iterCandidate.Value
-		//如果是当前区块的生产者，则币零还原为1
-		age , err := dposContext.VoteTrie().TryGet(candidate)
-		if err != nil {
-			return err
-		}
-		if header.Validator == common.BytesToAddress(candidate){
-			dposContext.VoteTrie().TryUpdate(candidate,[]byte("0"))
-		}else{
-			dposContext.VoteTrie().TryUpdate(candidate,IntToBytes(BytesToInt(age) + 1))
-			/*if age == nil{
-				dposContext.VoteTrie().TryUpdate(candidate,[]byte("1"))
-			}else{
-				dposContext.VoteTrie().TryUpdate(candidate,IntToBytes(BytesToInt(age) + 1))
-			}*/
-		}
-		fmt.Println(common.BytesToAddress(candidate).String(),BytesToInt(age))
-		existCandidate = iterCandidate.Next()
-	}
-	return nil
-}
 func (d *Dpos) Finalize(chain consensus.ChainReader, header *types.Header, state *state.StateDB, txs []*types.Transaction,
 	uncles []*types.Header, receipts []*types.Receipt, dposContext *types.DposContext) (*types.Block, error) {
 
-	addErr := AddAge(header,dposContext)
-	if addErr != nil {
-		return nil,addErr
-	}
-	// Accumulate block rewards and commit the final state root
-	AccumulatePosRewards( state, header,dposContext)
-	header.Root = state.IntermediateRoot(chain.Config().IsEIP158(header.Number))
 
-	parent := chain.GetHeaderByHash(header.ParentHash)
-	epochContext := &EpochContext{
-		statedb:     state,
-		DposContext: dposContext,
-		TimeStamp:   header.Time.Int64(),
-	}
-	if timeOfFirstBlock == 0 {
-		if firstBlockHeader := chain.GetHeaderByNumber(1); firstBlockHeader != nil {
-			timeOfFirstBlock = firstBlockHeader.Time.Int64()
-		}
-	}
-	genesis := chain.GetHeaderByNumber(0)
-	err := epochContext.tryElect(genesis, parent)
-	if err != nil {
-		return nil, fmt.Errorf("got error when elect next epoch, err: %s", err)
-	}
-
-	//update mint count trie
-	updateMintCnt(parent.Time.Int64(), header.Time.Int64(), header.Validator, dposContext)
 	header.DposContext = dposContext.ToProto()
 	return types.NewBlock(header, txs, uncles, receipts), nil
 }
@@ -467,15 +291,7 @@ func (d *Dpos) CheckValidator(lastBlock *types.Block, now int64) error {
 	}
 	dposContext, err := types.NewDposContextFromProto(d.db, lastBlock.Header().DposContext)
 	if err != nil {
-		return err
-	}
-	epochContext := &EpochContext{DposContext: dposContext}
-	validator, err := epochContext.lookupValidator(now)
-	if err != nil {
-		return err
-	}
-	if (validator == common.Address{}) || bytes.Compare(validator.Bytes(), d.signer.Bytes()) != 0 {
-		return ErrInvalidBlockValidator
+		return idator
 	}
 	return nil
 }
@@ -489,23 +305,7 @@ func (d *Dpos) Seal(chain consensus.ChainReader, block *types.Block, stop <-chan
 	if number == 0 {
 		return nil, errUnknownBlock
 	}
-	now := time.Now().Unix()
-	delay := NextSlot(now) - now
-	if delay > 0 {
-		select {
-		case <-stop:
-			return nil, nil
-		case <-time.After(time.Duration(delay) * time.Second):
-		}
-	}
-	block.Header().Time.SetInt64(time.Now().Unix())
 
-	// time's up, sign the block
-	sighash, err := d.signFn(accounts.Account{Address: d.signer}, sigHash(header).Bytes())
-	if err != nil {
-		return nil, err
-	}
-	copy(header.Extra[len(header.Extra)-extraSeal:], sighash)
 	return block.WithSeal(header), nil
 }
 
@@ -536,16 +336,7 @@ func ecrecover(header *types.Header, sigcache *lru.ARCCache) (common.Address, er
 	if address, known := sigcache.Get(hash); known {
 		return address.(common.Address), nil
 	}
-	// Retrieve the signature from the header extra-data
-	if len(header.Extra) < extraSeal {
-		return common.Address{}, errMissingSignature
-	}
-	signature := header.Extra[len(header.Extra)-extraSeal:]
-	// Recover the public key and the Ethereum address
-	pubkey, err := crypto.Ecrecover(sigHash(header).Bytes(), signature)
-	if err != nil {
-		return common.Address{}, err
-	}
+	
 	var signer common.Address
 	copy(signer[:], crypto.Keccak256(pubkey[1:])[12:])
 	sigcache.Add(hash, signer)
@@ -567,22 +358,7 @@ func updateMintCnt(parentBlockTime, currentBlockTime int64, validator common.Add
 	currentEpochBytes := make([]byte, 8)
 	binary.BigEndian.PutUint64(currentEpochBytes, uint64(currentEpoch))
 
-	cnt := int64(1)
-	newEpoch := currentBlockTime / epochInterval
-	// still during the currentEpochID
-	if currentEpoch == newEpoch {
-		iter := trie.NewIterator(currentMintCntTrie.NodeIterator(currentEpochBytes))
 
-		// when current is not genesis, read last count from the MintCntTrie
-		if iter.Next() {
-			cntBytes := currentMintCntTrie.Get(append(currentEpochBytes, validator.Bytes()...))
-
-			// not the first time to mint
-			if cntBytes != nil {
-				cnt = int64(binary.BigEndian.Uint64(cntBytes)) + 1
-			}
-		}
-	}
 
 	newCntBytes := make([]byte, 8)
 	newEpochBytes := make([]byte, 8)
